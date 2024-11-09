@@ -1,2 +1,5 @@
 streamlit
-openai
+groq
+langchain_groq
+qdrant_client
+sentence_transformers

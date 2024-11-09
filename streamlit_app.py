@@ -1,53 +1,91 @@
+import os
 import streamlit as st
-from openai import OpenAI
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
+from langchain.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Qdrant
+from langchain_core.prompts import ChatPromptTemplate
+from operator import itemgetter
+from langchain.schema.output_parser import StrOutputParser
 
-# Show title and description.
-st.title("📄 Document question answering")
-st.write(
-    "Upload a document below and ask a question about it – GPT will answer! "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
+os.environ["GROQ_API_KEY"] = "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"
+
+# Define embedding model
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-en"
+#EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+embedding_model = HuggingFaceEmbeddings(
+    model_name=EMBEDDING_MODEL_NAME,
+    multi_process=True,
+    model_kwargs={"device": "cpu"},
+    encode_kwargs={"normalize_embeddings": True},  # Set `True` for cosine similarity
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# Define language model
+#llm = ChatGroq(temperature=1, model_name="mixtral-8x7b-32768")
+llm = ChatGroq(model_name="gemma2-9b-it")
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
 
-    # Let the user upload a file via `st.file_uploader`.
-    uploaded_file = st.file_uploader(
-        "Upload a document (.txt or .md)", type=("txt", "md")
+    
+docs = PyMuPDFLoader(pdf_url).load()
+    
+# Split the PDF into chunks ready for embedding
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size = 300,
+    chunk_overlap = 0,
+    length_function = len,
+)
+
+split_chunks = text_splitter.split_documents(docs)
+
+# Create a vector database and temporary collection
+qdrant_vectorstore = Qdrant.from_documents(
+    split_chunks,
+    embedding_model,
+    location=":memory:",
+    collection_name="temp_pdf",
+)
+    
+qdrant_retriever = qdrant_vectorstore.as_retriever()
+
+def generate_response(input_text):
+    # Define prompt
+    RAG_PROMPT = """
+    CONTEXT:
+    {context}
+
+    QUERY:
+    {question}
+
+    You are a helpful assistant. Use the available context to answer the question. If you can't answer the question, say you don't know.
+    """
+
+    rag_prompt = ChatPromptTemplate.from_template(RAG_PROMPT)
+    rag_chain = (
+        {"context": itemgetter("question") | qdrant_retriever, "question": itemgetter("question")}
+        | rag_prompt | llm | StrOutputParser()
     )
+    response = rag_chain.invoke({"question" : input_text})
+    return response
 
-    # Ask the user for a question via `st.text_area`.
-    question = st.text_area(
-        "Now ask a question about the document!",
-        placeholder="Can you give me a short summary?",
-        disabled=not uploaded_file,
+### Streamlit app
+st.title("🗎 Instabot Docs")
+
+pdf_url = st.sidebar.text_input("Link to pdf:", type="default", help="e.g. https://arxiv.org/pdf/2410.15608v2")
+if st.sidebar.button("Read PDF"):
+    create_vector_db()
+
+with st.form("my_form"):
+    text = st.text_area(
+        "Enter text:",
+        "Can you give me a brief summary please?",
     )
-
-    if uploaded_file and question:
-
-        # Process the uploaded file and question.
-        document = uploaded_file.read().decode()
-        messages = [
-            {
-                "role": "user",
-                "content": f"Here's a document: {document} \n\n---\n\n {question}",
-            }
-        ]
-
-        # Generate an answer using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            stream=True,
-        )
-
-        # Stream the response to the app using `st.write_stream`.
-        st.write_stream(stream)
+    
+    submitted = st.form_submit_button("Submit")
+    
+    if not pdf_url.startswith("htt"):
+        st.warning("Please enter the direct URL of the .pdf document itself, e.g. https://arxiv.org/pdf/2410.15608v2 or https://www.site.com/document.pdf", icon="⚠")
+    if submitted:
+        answer = generate_response(text)
+        st.write(answer)
